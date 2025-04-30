@@ -12,7 +12,8 @@ requiredFiles = [".replit", "replit.nix"]
 
 [deployment]
 run = ["python3", "main.py"]
-deploymentTarget = "cloudrun"
+deploymentTarget = "gce"
+ignorePorts = true
 
 [[ports]]
 localPort = 8080
