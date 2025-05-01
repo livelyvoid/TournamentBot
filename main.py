@@ -363,4 +363,25 @@ __Note:__ Use commands in #bot-commands only.
 """
     await ctx.send(help_text)
 
-bot.run(os.getenv("TOKEN"))
+if __name__ == "__main__":
+    # Start Flask server
+    from flask import Flask
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def health():
+        return {"status": "ok", "bot": str(bot.user)}
+    
+    import threading
+    def run_bot():
+        token = os.getenv("TOKEN")
+        if not token:
+            print("ERROR: No TOKEN environment variable set")
+            return
+        bot.run(token)
+    
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    
+    # Start Flask on port 8080 for Autoscale
+    app.run(host='0.0.0.0', port=8080)
