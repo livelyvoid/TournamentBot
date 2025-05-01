@@ -46,7 +46,7 @@ async def check_tournament_start():
 async def auto_dq_check():
     to_remove = []
     for match in tournament_matches:
-        if match[1] != "BYE" and datetime.now() - last_report_times.get(match, datetime.now()) > timedelta(minutes=30):
+        if match[1] != "BYE" and datetime.now() - last_report_times.get(match, datetime.now()) > timedelta(hours=1):
             winner = random.choice(match)
             loser = match[0] if winner == match[1] else match[1]
             to_remove.append((winner, loser))
@@ -64,8 +64,28 @@ async def ensure_command_channel(ctx):
 @bot.command()
 async def register(ctx, *, gamertag):
     if not await ensure_command_channel(ctx): return
-    teams[ctx.author.id] = {'gamertag': gamertag, 'team': None, 'captain': False}
-    await ctx.send(f"{ctx.author.mention} registered with gamertag: {gamertag}")
+    existing = teams.get(ctx.author.id)
+    teams[ctx.author.id] = {
+        'gamertag': gamertag,
+        'team': existing['team'] if existing else None,
+        'captain': existing['captain'] if existing else False
+    }
+    msg = f"{ctx.author.mention} registered with gamertag: {gamertag}"
+    if existing and existing.get('gamertag'):
+        msg += f" (updated from: {existing['gamertag']})"
+    await ctx.send(msg)
+
+@bot.command()
+async def my_info(ctx):
+    if not await ensure_command_channel(ctx): return
+    data = teams.get(ctx.author.id)
+    if not data:
+        await ctx.send("You have not registered yet. Use !register <YourActivisionID>")
+        return
+    gamertag = data.get('gamertag', 'Unknown')
+    team = data.get('team', 'No team')
+    captain = "Yes" if data.get('captain') else "No"
+    await ctx.send(f"**Your Info:**\nGamertag: {gamertag}\nTeam: {team}\nCaptain: {captain}")
 
 @bot.command()
 async def create_team(ctx, *, team_name):
@@ -111,10 +131,7 @@ async def change_player(ctx, old_member: discord.Member, new_member: discord.Mem
         await ctx.send("Only team captains can change players.")
         return
     team_name = captain_data.get('team')
-    if not team_name:
-        await ctx.send("You don't have a team.")
-        return
-    if old_member.id not in team_rosters[team_name]:
+    if not team_name or old_member.id not in team_rosters[team_name]:
         await ctx.send("That player is not on your team.")
         return
     team_rosters[team_name].remove(old_member.id)
@@ -125,11 +142,14 @@ async def change_player(ctx, old_member: discord.Member, new_member: discord.Mem
     await ctx.send(f"{old_member.mention} has been replaced by {new_member.mention} on team {team_name}")
 
 @bot.command()
-async def team_info(ctx, *, team_name):
+async def team_info(ctx, *, team_name=None):
     if not await ensure_command_channel(ctx): return
-    if teams.get(ctx.author.id, {}).get('captain') is not True:
-        await ctx.send("Only team captains can use this command.")
-        return
+    if not team_name:
+        data = teams.get(ctx.author.id)
+        if not data or not data.get("team"):
+            await ctx.send("You must provide a team name or be on a team.")
+            return
+        team_name = data["team"]
     if team_name not in team_rosters:
         await ctx.send("That team does not exist.")
         return
@@ -141,6 +161,18 @@ async def team_info(ctx, *, team_name):
         role = " (Captain)" if info.get('captain') else ""
         member_lines.append(f"- {name}{role} ({user.name})")
     await ctx.send(f"**Team {team_name}:**\n" + "\n".join(member_lines))
+
+@bot.command()
+async def teams_list(ctx):
+    if not await ensure_command_channel(ctx): return
+    if not team_rosters:
+        await ctx.send("No teams created yet.")
+        return
+    message = "**Teams and Players:**\n"
+    for team, members in team_rosters.items():
+        names = [teams[uid]['gamertag'] for uid in members if uid in teams]
+        message += f"- **{team}**: {', '.join(names)}\n"
+    await ctx.send(message)
 
 @bot.command()
 async def set_team_size(ctx, size: int):
@@ -156,24 +188,9 @@ async def set_team_size(ctx, size: int):
     await ctx.send(f"Team size set to {size} players per team.")
 
 @bot.command()
-async def test_mode(ctx):
-    if not await ensure_command_channel(ctx): return
-    global teams, team_rosters, players_per_team, is_test_mode
-    teams_backup.update(teams)
-    base_id = 1000000
-    for i in range(1, 9):
-        uid = base_id + i
-        team_name = f"TestTeam{i}"
-        teams[uid] = {'gamertag': f"TestPlayer{i}", 'team': team_name, 'captain': True}
-        team_rosters[team_name] = [uid]
-    players_per_team = 1
-    is_test_mode = True
-    await ctx.send("**Test mode loaded with 8 fake teams. Use !start_tournament to run the bracket.**")
-
-@bot.command()
 async def set_tournament_date(ctx, *, date_str):
-    if not await ensure_command_channel(ctx): return
     global tournament_date
+    if not await ensure_command_channel(ctx): return
     try:
         tournament_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         await ctx.send(f"Tournament start date set to: {tournament_date}")
@@ -183,10 +200,13 @@ async def set_tournament_date(ctx, *, date_str):
 @bot.command()
 async def start_tournament(ctx):
     if not await ensure_command_channel(ctx): return
-    if tournament_started:
+    if tournament_started and not is_test_mode:
         await ctx.send("Tournament already started!")
         return
-    await auto_start_tournament(ctx.channel)
+        await ctx.send("Tournament already started!")
+        return
+    channel = discord.utils.get(ctx.guild.text_channels, name=TOURNAMENT_CHANNEL_NAME)
+    await auto_start_tournament(channel)
 
 async def auto_start_tournament(channel):
     global tournament_started, current_round, tournament_matches, winners_by_round
@@ -194,39 +214,38 @@ async def auto_start_tournament(channel):
     if len(full_teams) < 2:
         await channel.send("Not enough full teams to start the tournament.")
         return
+
     random.shuffle(full_teams)
     current_round = 1
     tournament_matches.clear()
     winners_by_round.clear()
     match_schedule.clear()
-    noon_time = datetime.combine(datetime.now().date(), dtime(hour=20))
+
     for i in range(0, len(full_teams), 2):
         if i + 1 < len(full_teams):
             match = (full_teams[i], full_teams[i + 1])
             tournament_matches.append(match)
-            match_schedule[match] = noon_time.strftime("%I:%M %p EST")
-            last_report_times[match] = datetime.now()
+            match_schedule[match] = "08:00 PM EST"
         else:
-            tournament_matches.append((full_teams[i], "BYE"))
+            match = (full_teams[i], "BYE")
+            tournament_matches.append(match)
             winners_by_round.setdefault(current_round, []).append(full_teams[i])
+
     tournament_started = True
-    tournament_channel = discord.utils.get(channel.guild.text_channels, name=TOURNAMENT_CHANNEL_NAME)
-    if tournament_channel:
-        await tournament_channel.send("**Tournament Started! Round 1 Matches:**")
-        for match in tournament_matches:
-            if match[1] == "BYE":
-                await tournament_channel.send(f"**{match[0]}** gets a BYE")
-            else:
-                await tournament_channel.send(f"**{match[0]}** vs **{match[1]}** — Starts at 08:00 PM EST")
+    await channel.send(f"**Tournament Started - Round {current_round} Matches:**")
+    for match in tournament_matches:
+        if match[1] == "BYE":
+            await channel.send(f"**{match[0]}** gets a BYE")
+        else:
+            time_str = match_schedule.get(match, "TBD")
+            await channel.send(f"**{match[0]}** vs **{match[1]}** - Starts at {time_str}")
 
 @bot.command()
 async def report(ctx, winner: str, loser: str):
     if not await ensure_command_channel(ctx): return
-    if not is_test_mode:
-        reporter = teams.get(ctx.author.id, {})
-        if reporter.get('team') not in [winner, loser]:
-            await ctx.send("You can only report results for your own team.")
-            return
+    if teams.get(ctx.author.id, {}).get('team') not in [winner, loser]:
+        await ctx.send("You can only report results for your own team.")
+        return
     await handle_report(ctx, winner, loser)
 
 @bot.command()
@@ -240,36 +259,60 @@ async def override_result(ctx, winner: str, loser: str):
 async def handle_report(ctx, winner, loser, override=False):
     global current_round, tournament_matches, champion
     match_reports.append((winner, loser))
-    tournament_matches = [match for match in tournament_matches if set(match) != set((winner, loser))]
+    tournament_matches[:] = [m for m in tournament_matches if set(m) != set((winner, loser))]
     winners_by_round.setdefault(current_round, []).append(winner)
-    tournament_channel = discord.utils.get(ctx.guild.text_channels, name=TOURNAMENT_CHANNEL_NAME)
-    if tournament_channel:
-        await tournament_channel.send(f"Match {'overridden' if override else 'reported'}: **{winner}** beat **{loser}**")
+
+    channel = discord.utils.get(ctx.guild.text_channels, name=TOURNAMENT_CHANNEL_NAME)
+    if channel:
+        await channel.send(f"Match {'overridden' if override else 'reported'}: **{winner}** beat **{loser}**")
+
     if not tournament_matches:
         if len(winners_by_round[current_round]) == 1:
             champion = winners_by_round[current_round][0]
-            await tournament_channel.send(f"**Tournament Winner: {champion}! Congratulations!**")
+            await channel.send(f"**Tournament Winner: {champion}! Congratulations!**")
         else:
             current_round += 1
             next_teams = winners_by_round[current_round - 1]
             random.shuffle(next_teams)
             tournament_matches.clear()
             match_schedule.clear()
+            await channel.send(f"**Round {current_round} Matchups:**")
             for i in range(0, len(next_teams), 2):
                 if i + 1 < len(next_teams):
                     match = (next_teams[i], next_teams[i + 1])
                     tournament_matches.append(match)
-                    match_schedule[match] = datetime.now().strftime("%I:%M %p EST")
-                    last_report_times[match] = datetime.now()
+                    match_schedule[match] = "Immediately"
                 else:
-                    tournament_matches.append((next_teams[i], "BYE"))
+                    match = (next_teams[i], "BYE")
+                    tournament_matches.append(match)
                     winners_by_round.setdefault(current_round, []).append(next_teams[i])
-            await tournament_channel.send(f"**Round {current_round} Matchups:**")
             for match in tournament_matches:
                 if match[1] == "BYE":
-                    await tournament_channel.send(f"**{match[0]}** gets a BYE")
+                    await channel.send(f"**{match[0]}** gets a BYE")
                 else:
-                    await tournament_channel.send(f"**{match[0]}** vs **{match[1]}**")
+                    await channel.send(f"**{match[0]}** vs **{match[1]}** - Starts at {match_schedule[match]}")
+
+@bot.command()
+async def matches(ctx):
+    if not await ensure_command_channel(ctx): return
+    if not match_reports:
+        await ctx.send("No match reports yet.")
+    else:
+        result = "\n".join([f"{w} beat {l}" for w, l in match_reports])
+        await ctx.send("**Match Results:**\n" + result)
+
+@bot.command()
+async def leaderboard(ctx):
+    if not await ensure_command_channel(ctx): return
+    wins = {}
+    for winner, _ in match_reports:
+        wins[winner] = wins.get(winner, 0) + 1
+    if wins:
+        sorted_board = sorted(wins.items(), key=lambda x: x[1], reverse=True)
+        board = "\n".join([f"{team}: {score} win(s)" for team, score in sorted_board])
+        await ctx.send("**Leaderboard:**\n" + board)
+    else:
+        await ctx.send("No matches reported yet.")
 
 @bot.command()
 async def winner(ctx, *, team_name):
@@ -278,118 +321,46 @@ async def winner(ctx, *, team_name):
     await ctx.send(f"**Tournament Winner Manually Set: {champion}! Congratulations!**")
 
 @bot.command()
-async def teams_list(ctx):
+async def test_mode(ctx):
     if not await ensure_command_channel(ctx): return
-    summary = "\n".join([f"<@{uid}>: {info.get('gamertag', 'Unknown')} - {info.get('team', 'No team')}" for uid, info in teams.items()])
-    await ctx.send(f"**Registered Players and Teams:**\n{summary}")
+    global teams, team_rosters, players_per_team, is_test_mode
+    base_id = 1000000
+    for i in range(1, 9):
+        uid = base_id + i
+        team_name = f"TestTeam{i}"
+        teams[uid] = {'gamertag': f"TestPlayer{i}", 'team': team_name, 'captain': True}
+        team_rosters[team_name] = [uid]
+    players_per_team = 1
+    is_test_mode = True
+    await ctx.send("**Test mode loaded with 8 fake teams. Use !start_tournament to run the bracket.**")
 
 @bot.command()
-async def matches(ctx):
-    if not await ensure_command_channel(ctx): return
-    if not match_reports:
-        await ctx.send("No match reports yet.")
-    else:
-        report_str = "\n".join([f"{w} beat {l}" for w, l in match_reports])
-        await ctx.send(f"**Match Results:**\n{report_str}")
-
-@bot.command()
-async def leaderboard(ctx):
-    if not await ensure_command_channel(ctx): return
-    team_wins = {}
-    for winner, _ in match_reports:
-        team_wins[winner] = team_wins.get(winner, 0) + 1
-    if not team_wins:
-        await ctx.send("No match results yet.")
-        return
-    leaderboard = sorted(team_wins.items(), key=lambda x: x[1], reverse=True)
-    lines = [f"{team}: {wins} win(s)" for team, wins in leaderboard]
-    await ctx.send("**Leaderboard:**\n" + "\n".join(lines))
-
-@bot.command()
-async def status(ctx):
-    if not await ensure_command_channel(ctx): return
-    if not tournament_started:
-        await ctx.send("Tournament hasn't started yet.")
-        return
-    embed = discord.Embed(title=f"Tournament Status - Round {current_round}", color=0x00ff00)
-    embed.add_field(name="Current Matches", value="\n".join([f"{a} vs {b}" for a, b in tournament_matches]), inline=False)
-    if match_reports:
-        embed.add_field(name="Completed Matches", value="\n".join([f"{w} beat {l}" for w, l in match_reports]), inline=False)
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def welcome_embed(ctx):
-    if not await ensure_command_channel(ctx): return
-    embed = discord.Embed(
-        title="Welcome to the COD Tournament Hub!",
-        description="Follow these steps to get started and compete:",
-        color=0x00bfff
-    )
-    embed.add_field(
-        name="1. Register with Your Activision ID",
-        value="In `#bot-commands`, type: `!register YourActivisionID`\n(This is required to compete)",
-        inline=False
-    )
-    embed.add_field(
-        name="2. Create or Join a Team",
-        value="Lead a team: `!create_team TeamName`\nJoin one: `!join_team TeamName`",
-        inline=False
-    )
-    embed.add_field(
-        name="3. Manage Your Roster",
-        value="Captains only:\n- Swap players: `!change_player @Old @New`\n- View team: `!team_info TeamName`",
-        inline=False
-    )
-    embed.add_field(
-        name="4. Report Matches",
-        value="Use `!report WinnerTeam LoserTeam` after your game\nAdmins: `!override_result Winner Loser`",
-        inline=False
-    )
-    embed.add_field(
-        name="5. Check Progress",
-        value="Use these anytime:\n`!status`, `!matches`, `!leaderboard`, `!teams_list`, `!commands`",
-        inline=False
-    )
-    embed.add_field(
-        name="Important Rules",
-        value="Use `#bot-commands` for commands\nCheck `#tournament` for brackets\nMissing matches = auto disqualification",
-        inline=False
-    )
-    embed.set_footer(text="Let’s compete fair and have fun — good luck, soldiers!")
-    await ctx.send(embed=embed)
-
-@bot.command(name="commands")
-async def show_commands(ctx):
+async def commands(ctx):
     if not await ensure_command_channel(ctx): return
     help_text = """
 **Tournament Bot Commands**
 
-__Setup & Registration:__
-`!register [gamertag]` – Register yourself with a gamertag  
-`!create_team [team_name]` – Create a new team  
-`!join_team [team_name]` – Join an existing team  
-`!change_player @old @new` – Captain only: replace a player  
+__Registration & Teams:__
+`!register [gamertag]` - Register your Activision ID  
+`!create_team [name]` - Create a new team  
+`!join_team [name]` - Join an existing team  
+`!change_player @old @new` - Swap players (captain only)  
+`!team_info [name]` - View a teams roster  
+`!teams_list` - Show all teams and members  
+`!my_info` - View your registration
 
 __Tournament Setup:__
-`!set_team_size [number]` – Set players per team  
-`!set_tournament_date [YYYY-MM-DD]` – Set auto start date  
-`!start_tournament` – Manually start the tournament  
+`!set_team_size [num]`  
+`!set_tournament_date [YYYY-MM-DD]`  
+`!start_tournament`  
+`!test_mode` - Load 8 test teams  
+`!report [winner] [loser]`  
+`!override_result [winner] [loser]` (admin)  
+`!winner [team]` - Manually declare winner  
+`!leaderboard`, `!matches`
 
-__Testing & Debugging:__
-`!test_mode` – Load 8 fake teams for dry run  
-
-__Match Management:__
-`!report [winner] [loser]` – Report match result  
-`!override_result [winner] [loser]` – Admin: override result  
-`!winner [team_name]` – Manually declare winner  
-
-__Info & Monitoring:__
-`!status` – View current round + matches  
-`!matches` – View completed match results  
-`!leaderboard` – View current rankings  
-`!teams_list` – List all players and their teams  
-`!team_info [team_name]` – Captain only: view team roster
+__Note:__ Use commands in #bot-commands only.
 """
     await ctx.send(help_text)
 
-bot.run(os.getenv('TOKEN'))
+bot.run(os.getenv("TOKEN"))
